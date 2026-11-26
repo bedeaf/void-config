@@ -11,7 +11,8 @@ Selected configuration from my ThinkPad T14 Gen 2 Intel: Void Linux, runit, ZFS 
 - NetworkManager randomizes scan and connection MAC addresses and sends DNS to the local DNSCrypt proxy.
 - Documented the existing kernel protections: full userspace ASLR, restricted ptrace and kernel logs, disabled unprivileged BPF, and build-time memory protections. See [the kernel snapshot](KERNEL.md) for values and limits.
 - TLP separates AC and battery CPU/GPU limits; thinkfan provides a hardware-specific fan curve.
-- Picom uses XRender, VSync and damage tracking with cosmetic effects disabled.
+- Picom uses the GLX backend, VSync and damage tracking with cosmetic effects disabled, and runs with real-time scheduling through rtkit (`--realtime`).
+- `thaw` watches for freezes. It logs X server stalls, kills a compositor that may hold a server grab, and restarts one that stopped painting. A probe hidden by the screen saver, a locker or a window above it is not blamed on the compositor.
 - dwm, slstatus, urxvt and Neovim share an eyes.nvim-inspired grayscale palette.
 
 ### Measurements
@@ -24,13 +25,22 @@ Recorded on 23 October 2026, kernel `7.2.11_1`:
 | Older retained initramfs, `6.18.54_1` | 208.73 MiB |
 | Current initramfs, `7.2.11_1` | 41.14 MiB |
 
+Picom, recorded on 26 November 2026 (Intel Iris Xe, modesetting without TearFree, 1920x1080 at 60 Hz). A 1880x1000 window repainted about 50 times a second for 6 s, with the Present completion mode of each composited frame counted on the overlay window:
+
+| Configuration | Frames presented as flips | Copies | Frames late for the vblank, all 8 CPUs busy |
+| --- | --- | --- | --- |
+| GLX | 100% | 0 | 28 |
+| GLX, `--realtime` | 100% | 0 | 17 |
+
+Late frames are picom's own "render did not complete during vblank" debug messages over two runs each. With the XRender backend every frame was also a flip, but its present call blocks picom's event loop until the vblank, so the same count is not available. Under that load Xorg used about 17% less CPU with GLX than with XRender, and picom used more. These are single-session measurements, not a controlled benchmark.
+
 The boot figure comes from the first monotonic timestamp in `/var/log/Xorg.0.log`, from one boot. It excludes firmware time and does not measure a fully ready desktop. There is no comparable before/after boot benchmark. The image sizes are an approximately 80% size difference across different kernel versions, not a controlled speedup measurement.
 
 ## Use
 
 `home/` mirrors files below your home directory; `etc/` mirrors system configuration. Read and merge individual files into the matching locations after backing up your originals. There is no bulk installer.
 
-- Build [dwm](https://github.com/merthium/dwm) separately. `cd slstatus && make` builds the companion status monitor; `sudo make install` installs it. Both need X11 development headers.
+- Build [dwm](https://github.com/bedeaf/dwm) separately. `cd slstatus && make` builds the companion status monitor; `sudo make install` installs it. `cd thaw && make install` puts `thaw` in `~/.local/bin`; it logs to `~/.local/state/thaw/thaw.log`. All need X11 development headers; thaw also needs the XRes and xcb-screensaver headers.
 - The small `home/.xinitrc` starts the public desktop components. It omits private app helpers; GTK uses Adwaita defaults and the custom urxvt drag-scroll extension is omitted. Install the programs it invokes before using it with `startx`.
 - `etc/dnscrypt-proxy/dnscrypt-proxy-settings.toml` is a settings excerpt: merge its top-level values into your packaged `dnscrypt-proxy.toml`, before any table headers. Keep the packaged `[sources]` tables and their public signature-verification keys. Do not replace the full configuration with this excerpt. DNSCrypt listens on `127.0.0.1:53`. Enable its packaged runit service before adopting the NetworkManager DNS override. Public resolver lists remain managed by DNSCrypt. This snapshot has no anonymized-DNS routes configured; encrypted DNS alone does not imply anonymity.
 - `etc/sv/host-privacy/run` loads only `etc/nftables/host-privacy.nft`. It drops new inbound connections, including SSH, and some discovery traffic. Add exceptions you need before enabling the service. Keep another way to access the machine when changing firewall rules.
@@ -42,4 +52,4 @@ No SSH/WireGuard keys, network profiles, browser data, credentials, host IDs or 
 
 Inspired by the small, composable tools documented in the [Void Handbook](https://docs.voidlinux.org/) and [suckless](https://suckless.org/). Palette: [eyes.nvim](https://github.com/amedoeyes/eyes.nvim). slstatus is based on [suckless slstatus](https://tools.suckless.org/slstatus/), with its upstream license preserved in `slstatus/LICENSE`.
 
-Related: [dwm](https://github.com/merthium/dwm) · [Neovim](https://github.com/merthium/nvim).
+Related: [dwm](https://github.com/bedeaf/dwm) · [Neovim](https://github.com/bedeaf/nvim).

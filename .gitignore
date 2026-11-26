@@ -1,5 +1,6 @@
 *.o
 /slstatus/slstatus
+/thaw/thaw
 /slstatus/*.tar.gz
 *.key
 *.pem
