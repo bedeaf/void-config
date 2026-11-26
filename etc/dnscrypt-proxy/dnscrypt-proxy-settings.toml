@@ -1,5 +1,9 @@
 listen_addresses = ['127.0.0.1:53']
 
+# A few large no-log, unfiltered resolvers. With every matching server, cold
+# lookups often landed on small resolvers with cold caches.
+server_names = ['adguard-dns-unfiltered-doh', 'mullvad-doh', 'quad9-doh-ip4-port443-nofilter-pri', 'dnsforge.de-nofilter']
+
 max_clients = 250
 
 ipv4_servers = true
