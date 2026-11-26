@@ -1,0 +1,230 @@
+diff --git a/crates/tuigreet-locales/locales/en-US/tuigreet-locales.ftl b/crates/tuigreet-locales/locales/en-US/tuigreet-locales.ftl
+index 4a6f8b6..b27ae0e 100644
+--- a/crates/tuigreet-locales/locales/en-US/tuigreet-locales.ftl
++++ b/crates/tuigreet-locales/locales/en-US/tuigreet-locales.ftl
+@@ -32,3 +32,7 @@ command_failed = Command failed
+ status_command = CMD
+ status_session = SESS
+ status_caps = CAPS LOCK
++
++power_hint_reboot = reboot
++power_hint_shutdown = power off
++power_hint_confirm = press again: { $action }
+diff --git a/crates/tuigreet/src/greeter.rs b/crates/tuigreet/src/greeter.rs
+index 1efc213..3557194 100644
+--- a/crates/tuigreet/src/greeter.rs
++++ b/crates/tuigreet/src/greeter.rs
+@@ -144,6 +144,10 @@ pub struct Greeter {
+   pub powers:       Menu<Power>,
+   // Whether to prefix the power commands with `setsid`.
+   pub power_setsid: bool,
++  // Direct power F-keys (0 = off) and the action armed by a first press.
++  pub power_key_reboot:   u8,
++  pub power_key_shutdown: u8,
++  pub power_armed:        Option<(crate::power::PowerOption, std::time::Instant)>,
+ 
+   pub kb_command:    u8,
+   pub kb_sessions:   u8,
+@@ -216,6 +220,9 @@ impl Default for Greeter {
+       message:                    None,
+       powers:                     Menu::default(),
+       power_setsid:               false,
++      power_key_reboot:           0,
++      power_key_shutdown:         0,
++      power_armed:                None,
+       kb_command:                 2,
+       kb_sessions:                3,
+       kb_power:                   12,
+@@ -1088,6 +1095,17 @@ impl Greeter {
+       .opt_str("kb-background")
+       .map_or(4, |i| i.parse::<u8>().unwrap_or_default());
+ 
++    // TUIGREET_POWER_KEYS="2,3": F2 reboots, F3 powers off (each needs a second
++    // press). Unset or malformed leaves the direct power keys off.
++    if let Ok(keys) = std::env::var("TUIGREET_POWER_KEYS") {
++      let mut keys = keys.split(',').map(|k| k.trim().parse::<u8>().unwrap_or(0));
++      let (reboot, shutdown) = (keys.next().unwrap_or(0), keys.next().unwrap_or(0));
++      if (1..=12).contains(&reboot) && (1..=12).contains(&shutdown) && reboot != shutdown {
++        self.power_key_reboot = reboot;
++        self.power_key_shutdown = shutdown;
++      }
++    }
++
+     let kbs = [
+       self.kb_command,
+       self.kb_sessions,
+diff --git a/crates/tuigreet/src/keyboard.rs b/crates/tuigreet/src/keyboard.rs
+index bc02fa4..cc30f0a 100644
+--- a/crates/tuigreet/src/keyboard.rs
++++ b/crates/tuigreet/src/keyboard.rs
+@@ -16,7 +16,7 @@ use crate::{
+     write_last_session_path,
+   },
+   ipc::Ipc,
+-  power::power,
++  power::{POWER_ARM_WINDOW, PowerOption, power},
+   ui::{
+     common::masked::MaskedString,
+     sessions::{Session, SessionSource},
+@@ -47,7 +47,34 @@ pub async fn handle(
+     return Ok(());
+   }
+ 
++  // Any key other than a direct power key disarms a pending power action.
++  let direct_power = match input.code {
++    KeyCode::F(i) if i != 0 && i == greeter.power_key_reboot => Some(PowerOption::Reboot),
++    KeyCode::F(i) if i != 0 && i == greeter.power_key_shutdown => Some(PowerOption::Shutdown),
++    _ => None,
++  };
++  if direct_power.is_none() {
++    greeter.power_armed = None;
++  }
++
+   match input {
++    // Direct power keys: first press arms, second press within
++    // POWER_ARM_WINDOW runs the action (same as the lock screen).
++    KeyEvent {
++      code: KeyCode::F(_), ..
++    } if direct_power.is_some() => {
++      let option = direct_power.unwrap_or_default();
++      let now = std::time::Instant::now();
++
++      match greeter.power_armed {
++        Some((armed, at)) if armed == option && now.duration_since(at) <= POWER_ARM_WINDOW => {
++          greeter.power_armed = None;
++          power(&mut greeter, option).await;
++        },
++        _ => greeter.power_armed = Some((option, now)),
++      }
++    },
++
+     // ^U should erase the current buffer.
+     KeyEvent {
+       code: KeyCode::Char('u'),
+@@ -809,6 +836,45 @@ mod test {
+     }
+   }
+ 
++  #[tokio::test]
++  async fn direct_power_keys() {
++    let greeter = Arc::new(RwLock::new(Greeter::default()));
++
++    {
++      let mut greeter = greeter.write().await;
++      greeter.mode = Mode::Username;
++      greeter.mock = true;
++      greeter.power_key_reboot = 2;
++      greeter.power_key_shutdown = 3;
++    }
++
++    let key = |code| KeyEvent::new(code, KeyModifiers::empty());
++
++    // First press arms reboot and does not open the command prompt (F2).
++    let _ = handle(greeter.clone(), key(KeyCode::F(2)), Ipc::new()).await;
++    {
++      let status = greeter.read().await;
++      assert!(matches!(status.power_armed, Some((PowerOption::Reboot, _))));
++      assert!(matches!(status.mode, Mode::Username));
++    }
++
++    // The other power key re-arms with its own action.
++    let _ = handle(greeter.clone(), key(KeyCode::F(3)), Ipc::new()).await;
++    assert!(matches!(
++      greeter.read().await.power_armed,
++      Some((PowerOption::Shutdown, _))
++    ));
++
++    // Any other key disarms.
++    let _ = handle(greeter.clone(), key(KeyCode::Char('a')), Ipc::new()).await;
++    assert!(greeter.read().await.power_armed.is_none());
++
++    // Second press of the same key runs the action (mock) and disarms.
++    let _ = handle(greeter.clone(), key(KeyCode::F(3)), Ipc::new()).await;
++    let _ = handle(greeter.clone(), key(KeyCode::F(3)), Ipc::new()).await;
++    assert!(greeter.read().await.power_armed.is_none());
++  }
++
+   #[tokio::test]
+   async fn f_menu_rebinded() {
+     let greeter = Arc::new(RwLock::new(Greeter::default()));
+diff --git a/crates/tuigreet/src/power.rs b/crates/tuigreet/src/power.rs
+index 33a0d34..5c14338 100644
+--- a/crates/tuigreet/src/power.rs
++++ b/crates/tuigreet/src/power.rs
+@@ -6,6 +6,12 @@ use tuigreet_types::Mode;
+ use crate::{Greeter, event::Event, ui::power::Power};
+ 
+ /// Power management options
++/// Direct power keys (like the lock screen's bottom-right hints): the first
++/// press arms the action, a second press of the same key within this window
++/// runs it. Enabled with `TUIGREET_POWER_KEYS=<reboot F-key>,<shutdown F-key>`.
++pub const POWER_ARM_WINDOW: std::time::Duration =
++  std::time::Duration::from_secs(3);
++
+ #[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
+ pub enum PowerOption {
+   #[default]
+diff --git a/crates/tuigreet/src/ui/mod.rs b/crates/tuigreet/src/ui/mod.rs
+index 998b475..0732dc6 100644
+--- a/crates/tuigreet/src/ui/mod.rs
++++ b/crates/tuigreet/src/ui/mod.rs
+@@ -193,11 +193,41 @@ where
+ 
+     // Render status bar if not hidden
+     if let Some(slot) = status_slot {
+-      let status_block_size_right = 1
+-        + greeter.window_padding()
+-        + fl!("status_caps").chars().count() as u16;
+-      let status_block_size_left =
+-        (size.width - greeter.window_padding()) - status_block_size_right;
++      // Right side: caps lock indicator and the direct power key hints.
++      let mut status_right_spans: Vec<Span> = vec![];
++      if greeter.status_show_caps_lock && capslock_status() {
++        status_right_spans.push(status_label(theme, fl!("status_caps")));
++        status_right_spans.push(Span::from("  "));
++      }
++      if greeter.power_key_reboot != 0 {
++        let armed = greeter
++          .power_armed
++          .filter(|(_, at)| at.elapsed() <= crate::power::POWER_ARM_WINDOW)
++          .map(|(option, _)| option);
++
++        for (key, option, label) in [
++          (greeter.power_key_reboot, crate::power::PowerOption::Reboot, fl!("power_hint_reboot")),
++          (greeter.power_key_shutdown, crate::power::PowerOption::Shutdown, fl!("power_hint_shutdown")),
++        ] {
++          let (text, style) = if armed == Some(option) {
++            (fl!("power_hint_confirm", action = label), theme.of(&[Themed::Input]))
++          } else {
++            (label, theme.of(&[Themed::Action]))
++          };
++          status_right_spans.push(status_label(theme, format!(" F{key} ")));
++          status_right_spans.push(Span::styled(format!(" {text}"), style));
++          status_right_spans.push(Span::from("  "));
++        }
++      }
++      let status_right_width: u16 = status_right_spans
++        .iter()
++        .map(|span| span.content.chars().count() as u16)
++        .sum();
++      let status_block_size_right = 1 + greeter.window_padding() + status_right_width;
++      let status_block_size_left = size
++        .width
++        .saturating_sub(greeter.window_padding())
++        .saturating_sub(status_block_size_right);
+ 
+       let status_chunks = Layout::default()
+         .direction(Direction::Horizontal)
+@@ -291,10 +321,9 @@ where
+ 
+       f.render_widget(status_left, status_chunks[STATUSBAR_LEFT_INDEX]);
+ 
+-      if greeter.status_show_caps_lock && capslock_status() {
+-        let status_right_text = status_label(theme, fl!("status_caps"));
++      if !status_right_spans.is_empty() {
+         let status_right =
+-          Paragraph::new(status_right_text).alignment(Alignment::Right);
++          Paragraph::new(Line::from(status_right_spans)).alignment(Alignment::Right);
+ 
+         f.render_widget(status_right, status_chunks[STATUSBAR_RIGHT_INDEX]);
+       }

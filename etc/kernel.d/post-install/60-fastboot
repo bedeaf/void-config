@@ -1,0 +1,5 @@
+#!/bin/sh
+# Kernel hook: copy the new kernel and its initramfs (built by 20-initramfs)
+# to the ESP for the fast boot path. Arguments: $1 pkgname, $2 version.
+[ -x /usr/local/sbin/fbt ] && /usr/local/sbin/fbt up "$2"
+exit 0

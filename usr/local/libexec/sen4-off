@@ -1,0 +1,15 @@
+#!/bin/sh
+# sen4-off: keep the SEN4 DPTF sensor away from int3403_thermal.
+#
+# \_SB.PC00.LPCB.EC.SEN4._TMP reads the discrete GPU's temperature
+# (\_SB.PC00.RP09.PEGP.DDNT). This T14 Gen 2i has no dGPU, so every read
+# fails with "ACPI BIOS Error (bug): Could not resolve symbol". With
+# driver_override set, the driver never binds SEN4 and never reads it;
+# SEN1-3 still bind and keep their 80 C critical trips.
+# Run by /etc/modprobe.d/50-sen4-no-dgpu.conf right before the module loads.
+# one grep over all ACPI device paths (a cat per device cost ~110 ms)
+for p in $(grep -l '\.EC__\.SEN4$' /sys/bus/acpi/devices/*/path 2>/dev/null); do
+	node=$(readlink -f "${p%/path}/physical_node") || continue
+	[ -w "$node/driver_override" ] && echo none > "$node/driver_override"
+done
+exit 0
