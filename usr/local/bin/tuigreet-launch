@@ -1,0 +1,29 @@
+#!/bin/sh
+
+# Keep crossterm on the Linux VT color path. The console font comes from
+# rc.conf: FONT is loaded on tty0..tty$TTYS by core-services, and TTYS=7
+# includes this greeter's tty7.
+export TERM=linux
+
+# English UI; LANG (tr_TR.UTF-8) and the trq keymap stay as they are.
+export LC_MESSAGES=en_US.UTF-8
+
+# Bottom-right power keys like the lock screen: F2 reboot, F3 power off,
+# each confirmed by a second press within 3 s (patch in
+# /usr/local/src/tuigreet-retro). F12's menu stays but is not advertised.
+export TUIGREET_POWER_KEYS=2,3
+export TUIGREET_STATUS_SHOW_POWER=false
+
+exec /usr/local/bin/tuigreet-retro \
+    --no-config \
+    --cmd startx \
+    --xsessions /etc/greetd/sessions \
+    --remember \
+    --remember-user-session \
+    --asterisks \
+    --asterisks-char '*' \
+    --kb-command 5 \
+    --kb-sessions 6 \
+    --theme 'container=black;border=darkgray;title=gray;text=gray;prompt=gray;greet=gray;input=white;action=darkgray;button=gray' \
+    --power-shutdown 'loginctl poweroff' \
+    --power-reboot 'loginctl reboot'

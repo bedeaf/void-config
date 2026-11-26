@@ -1,0 +1,147 @@
+#!/bin/sh
+# fbt: fast boot with automatic fallback to ZFSBootMenu.
+#
+# UEFI BootOrder keeps ZFSBootMenu first. After a boot reaches the login
+# screen, "fbt ok" (runit service fastok) sets the one-shot BootNext to
+# "Void fast", an entry that starts the kernel straight from the ESP and
+# skips the ZFSBootMenu kernel, its pool import, countdown and kexec.
+# Firmware deletes BootNext as soon as it uses it, so a fast boot that
+# panics (panic=10), hangs (power button) or fails in the initramfs
+# (rd.emergency=reboot) is followed by an ordinary ZFSBootMenu boot.
+# A fast attempt that ended in ZFSBootMenu disables the fast path until
+# "fbt on" or the next kernel update, so a broken kernel is not retried
+# on every boot. To reach ZFSBootMenu at any time: press F12 at the firmware
+# logo and pick ZFSBootMenu, or run "fbt zbm" before rebooting.
+#
+#   fbt st          status
+#   fbt on          re-enable the fast path and arm the next boot
+#   fbt zbm         make the next boot a ZFSBootMenu boot
+#   fbt up [ver]    copy the newest kernel + initramfs to the ESP
+#   fbt install     first-time setup: ESP copy and the "Void fast" entry
+#   fbt ok          (runit, once per boot) record the result, re-arm
+#   fbt down        (rc.shutdown) timestamp used to time the next boot
+set -eu
+ESP=/boot/efi
+DIR=$ESP/EFI/fast
+LABEL='Void fast'
+ST=/var/lib/fastboot
+LOG=/var/log/fastboot.log
+CMDLINE='root=zfs:zroot/ROOT/void spl.spl_hostid=0x00bab10c loglevel=4 panic=10 rd.shell=0 rd.emergency=reboot initrd=\EFI\fast\initramfs.img'
+
+log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
+entry() { efibootmgr | awk -F'\t' -v l="$1" '$1 ~ /^Boot[0-9A-F]{4}\* / && substr($1, 11) == l { print substr($1, 5, 4); exit }'; }
+current() { efibootmgr | sed -n 's/^BootCurrent: //p'; }
+bootnext() { efibootmgr | sed -n 's/^BootNext: //p'; }
+BOOTNEXT_VAR=/sys/firmware/efi/efivars/BootNext-8be4df61-93ca-11d2-aa0d-00e098032b8c
+# efibootmgr 18 cannot delete BootNext: -N is checked as if it were an entry
+# number ("Boot entry 0001 does not exist"); fixed upstream on 2024-01-08
+# (rhboot/efibootmgr 0ca99d4). Deleting the efivarfs file is the same
+# SetVariable(size 0) call efibootmgr makes.
+clear_bootnext() {
+	[ -e "$BOOTNEXT_VAR" ] || return 0
+	chattr -i "$BOOTNEXT_VAR" 2>/dev/null || true
+	rm -f "$BOOTNEXT_VAR"
+	[ ! -e "$BOOTNEXT_VAR" ]
+}
+newest() { ls /boot/vmlinuz-* | sed 's#.*/vmlinuz-##' | sort -V | tail -1; }
+arm() {
+	f=$(entry "$LABEL")
+	[ -n "$f" ] || { echo "no '$LABEL' entry; run fbt install" >&2; return 1; }
+	efibootmgr -q -n "$f"
+	mkdir -p "$ST"; touch "$ST/armed"
+}
+
+case "${1:-st}" in
+up)
+	v=${2:-$(newest)}
+	# the kernel hook runs once per installed version; only the newest goes to the ESP
+	[ "$v" = "$(newest)" ] || exit 0
+	mountpoint -q "$ESP" || { log "up $v: $ESP not mounted, skipped"; exit 1; }
+	mkdir -p "$DIR"
+	cp "/boot/vmlinuz-$v" "$DIR/vmlinuz.efi.new"
+	cp "/boot/initramfs-$v.img" "$DIR/initramfs.img.new"
+	sync
+	mv "$DIR/vmlinuz.efi.new" "$DIR/vmlinuz.efi"
+	mv "$DIR/initramfs.img.new" "$DIR/initramfs.img"
+	echo "$v" > "$DIR/version"
+	sync
+	# a new kernel deserves a fresh try even if the old one had failed
+	rm -f "$ST/failed"
+	log "up: $v copied to ESP"
+	echo "fast path now boots $v"
+	;;
+install)
+	"$0" up
+	if [ -z "$(entry "$LABEL")" ]; then
+		order=$(efibootmgr | sed -n 's/^BootOrder: //p')
+		efibootmgr -q -c -d /dev/nvme0n1 -p 1 -L "$LABEL" -l '\EFI\fast\vmlinuz.efi' -u "$CMDLINE"
+		# efibootmgr -c puts the new entry first; ZFSBootMenu must stay the default
+		efibootmgr -q -o "$order,$(entry "$LABEL")"
+		log "install: entry $(entry "$LABEL") created, BootOrder kept"
+	fi
+	efibootmgr | sed -n '/^BootOrder/p;/Void fast/p;/ZFSBootMenu\t/p' | cut -c1-80
+	;;
+ok)
+	# once per boot, even if runit restarts the service
+	[ -e /run/fbt-ok ] && exit 0
+	mkdir -p "$ST"
+	cur=$(current); fast=$(entry "$LABEL"); path=zbm
+	# the fallback relies on firmware deleting BootNext when it uses it
+	left=$(bootnext)
+	[ -z "$left" ] || log "WARNING: BootNext was still $left at boot; the firmware did not clear it"
+	if [ -n "$fast" ] && [ "$cur" = "$fast" ]; then
+		path=fast
+	elif [ -e "$ST/armed" ]; then
+		touch "$ST/failed"
+		log "FAILED: the fast boot was armed but this boot came through ZFSBootMenu ($cur). Fast path off until 'fbt on' or a kernel update."
+	fi
+	rm -f "$ST/armed"
+	if [ -e "$ST/down" ]; then
+		pid=$(pgrep -o -x greetd || true)
+		if [ -n "$pid" ]; then
+			gap=$(awk -v down="$(cat "$ST/down")" -v hz="$(getconf CLK_TCK)" \
+				'FNR == NR { if ($1 == "btime") bt = $2; next }
+				 { sub(/^.*\) /, ""); split($0, f, " "); printf "%.1f", bt + f[20] / hz - down }' \
+				/proc/stat "/proc/$pid/stat")
+			log "boot via $path: ${gap} s from shutdown to login screen"
+		fi
+		rm -f "$ST/down"
+	fi
+	[ -e "$ST/failed" ] || arm
+	touch /run/fbt-ok
+	;;
+on)
+	rm -f "$ST/failed"
+	arm
+	echo "next boot: fast path"
+	;;
+zbm)
+	# delete BootNext; if the firmware refuses, point it at ZFSBootMenu instead
+	clear_bootnext || efibootmgr -q -n "$(entry ZFSBootMenu)"
+	nb=$(bootnext)
+	if [ -n "$nb" ] && [ "$nb" != "$(entry ZFSBootMenu)" ]; then
+		echo "BootNext is still $nb; next boot is NOT ZFSBootMenu" >&2; exit 1
+	fi
+	rm -f "$ST/armed"
+	log "zbm: BootNext cleared by hand, next boot via ZFSBootMenu"
+	echo "next boot: ZFSBootMenu"
+	;;
+down)
+	mkdir -p "$ST"; date +%s.%N > "$ST/down"
+	;;
+st)
+	cur=$(current); next=$(bootnext); fast=$(entry "$LABEL"); zbm=$(entry ZFSBootMenu)
+	name() { case "$1" in "") echo "-" ;; "$fast") echo "$1 (fast)" ;; "$zbm") echo "$1 (ZFSBootMenu)" ;; *) echo "$1" ;; esac; }
+	echo "this boot:  $(name "$cur")"
+	echo "next boot:  $(name "${next:-$(efibootmgr | sed -n 's/^BootOrder: \([0-9A-F]*\).*/\1/p')}")"
+	echo "fast path:  $([ -e "$ST/failed" ] && echo "OFF after a failure (fbt on)" || echo on)"
+	if [ -r "$DIR/version" ]; then espk=$(cat "$DIR/version")
+	elif [ -d "$ESP" ] && [ ! -x "$ESP" ]; then espk="(ESP is root only: doas fbt st)"
+	else espk=none; fi
+	echo "ESP kernel: $espk   running: $(uname -r)"
+	[ -r "$LOG" ] && { echo "--"; tail -5 "$LOG"; }
+	;;
+*)
+	sed -n 's/^#   //p' "$0"; exit 2
+	;;
+esac

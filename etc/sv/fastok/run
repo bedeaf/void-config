@@ -1,0 +1,7 @@
+#!/bin/sh
+# fastok: once the login screen (greetd) is up, this boot counts as good:
+# record how it went and let the next boot take the fast path (see fbt).
+# Until greetd runs, exit and let runsv start us again a second later.
+sv check greetd >/dev/null 2>&1 || exec sleep 1
+/usr/local/sbin/fbt ok
+exec pause
