@@ -17,5 +17,6 @@ command -v xsettingsd >/dev/null && xsettingsd &
 command -v nm-applet >/dev/null && nm-applet &
 command -v xss-lock >/dev/null && xss-lock --transfer-sleep-lock -- i3lock -n -c 000000 &
 command -v slstatus >/dev/null && slstatus &
-picom --daemon
+picom --daemon --realtime
+command -v thaw >/dev/null && thaw -c "picom --daemon --realtime" &
 exec dwm
