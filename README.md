@@ -13,7 +13,7 @@ Selected configuration from my ThinkPad T14 Gen 2 Intel: Void Linux, runit, ZFS 
 - TLP separates AC and battery CPU/GPU limits; thinkfan provides a hardware-specific fan curve.
 - Picom uses the GLX backend, VSync and damage tracking with cosmetic effects disabled, and runs with real-time scheduling through rtkit (`--realtime`).
 - `thaw` watches for freezes. It logs X server stalls, kills a compositor that may hold a server grab, and restarts one that stopped painting. A probe hidden by the screen saver, a locker or a window above it is not blamed on the compositor.
-- dwm, slstatus, urxvt and Neovim share an eyes.nvim-inspired grayscale palette.
+- dwm, slstatus, urxvt and Neovim share the [batman](https://github.com/bedeaf/batman) palette: sixteen distinct grays on black, derived from eyes.nvim.
 
 ### Measurements
 
