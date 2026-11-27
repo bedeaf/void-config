@@ -1,0 +1,4 @@
+#!/bin/sh
+# Real-time YARA on new files. Blocks in the kernel (inotify) until something is written.
+exec 2>&1
+exec chpst -n 10 /usr/local/sbin/ward watch

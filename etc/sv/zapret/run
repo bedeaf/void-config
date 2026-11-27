@@ -1,0 +1,16 @@
+#!/bin/sh
+# zapret nfqws: DPI desync for outgoing TCP 80/443 (first packets only).
+exec 2>&1
+OPTS=$(head -n1 /etc/zapret.opts 2>/dev/null)
+[ -n "$OPTS" ] || OPTS="--dpi-desync=multisplit --dpi-desync-split-pos=2"
+nft delete table inet zapret 2>/dev/null
+nft -f - <<NFT
+table inet zapret {
+  chain out {
+    type filter hook postrouting priority mangle; policy accept;
+    meta mark & 0x40000000 != 0 return
+    tcp dport {80,443} ct original packets 1-6 queue flags bypass to 200
+  }
+}
+NFT
+exec /opt/zapret/nfq/nfqws --qnum=200 --dpi-desync-fwmark=0x40000000 $OPTS

@@ -1,0 +1,16 @@
+#!/bin/sh
+# Suricata on the default-route interface. Started and stopped by `ward power` (acpid),
+# so it never runs on battery. Priority 1-2 alerts become desktop notifications.
+exec 2>&1
+RULES=/var/lib/suricata/rules/suricata.rules
+[ -s "$RULES" ] || { /usr/local/sbin/ward ids-rules || { sleep 600; exit 1; }; }
+IF=$(ip route show default | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}')
+[ -n "$IF" ] || { sleep 60; exit 1; }
+L=/var/log/ward/ids; mkdir -p "$L"
+for f in fast.log eve.json stats.log suricata.log; do : > "$L/$f"; done   # logs only live per session
+suricata -c /etc/suricata/suricata.yaml --af-packet="$IF" -S "$RULES" -l "$L" &
+pid=$!
+trap 'kill $pid $tpid 2>/dev/null; wait $pid; exit 0' TERM INT
+tail -n0 -F "$L/fast.log" 2>/dev/null | /usr/local/sbin/ward ids-alert &
+tpid=$!
+wait $pid
