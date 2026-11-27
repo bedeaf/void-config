@@ -32,7 +32,8 @@ Recorded on 23 October 2026, kernel `7.2.11_1`:
 | --- | --- |
 | Kernel boot to first Xorg log entry | 17.862 s |
 | Older retained initramfs, `6.18.54_1` | 208.73 MiB |
-| Current initramfs, `7.2.11_1` | 41.14 MiB |
+| Initramfs then, `7.2.11_1` | 41.14 MiB |
+| Current initramfs, `6.18.63_1` (28 November 2026, strict host-only) | 14.47 MiB |
 
 Picom, recorded on 26 November 2026 (Intel Iris Xe, modesetting without TearFree, 1920x1080 at 60 Hz). A 1880x1000 window repainted about 50 times a second for 6 s, with the Present completion mode of each composited frame counted on the overlay window:
 
