@@ -1,0 +1,3 @@
+# /etc/acpi/events/ward-ac: start Suricata on mains, stop it on battery
+event=ac_adapter.*
+action=/usr/local/sbin/ward power

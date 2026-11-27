@@ -1,0 +1,128 @@
+#!/bin/sh
+
+USER_NAME="${USER_NAME:-$(id -nu 1000)}"
+
+ACTIVE="/etc/NetworkManager/conf.d/95-dnscrypt.conf"
+DISABLED="/etc/NetworkManager/conf.d/95-dnscrypt.conf.disabled"
+
+# Healthy: one probe a minute, so the CPU and the Wi-Fi radio can stay asleep.
+# After a failed probe: every 5 s until it is confirmed or recovers.
+INTERVAL_OK=60
+INTERVAL_BAD=5
+FAIL_LIMIT=2
+
+fails=0
+state="unknown"
+
+proc_env() {
+    pid="$1"
+    var="$2"
+
+    tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null |
+        sed -n "s/^${var}=//p" |
+        head -n1
+}
+
+notify_user() {
+    urgency="$1"
+    title="$2"
+    body="$3"
+
+    DUNST_PID="$(pgrep -u "$USER_NAME" -x dunst | head -n1)"
+    [ -n "$DUNST_PID" ] || return 0
+
+    DBUS_ADDR="$(proc_env "$DUNST_PID" DBUS_SESSION_BUS_ADDRESS)"
+    DISPLAY_VAR="$(proc_env "$DUNST_PID" DISPLAY)"
+    XDG_RUNTIME="$(proc_env "$DUNST_PID" XDG_RUNTIME_DIR)"
+    XAUTH="$(proc_env "$DUNST_PID" XAUTHORITY)"
+
+    [ -n "$DBUS_ADDR" ] || return 0
+
+    /usr/bin/chpst -u "$USER_NAME" \
+        env \
+        DBUS_SESSION_BUS_ADDRESS="$DBUS_ADDR" \
+        DISPLAY="$DISPLAY_VAR" \
+        XDG_RUNTIME_DIR="$XDG_RUNTIME" \
+        XAUTHORITY="$XAUTH" \
+        /usr/bin/notify-send \
+        -u "$urgency" \
+        -t 6000 \
+        -a "DNS Watchdog" \
+        "$title" "$body" \
+        >/dev/null 2>&1 || true
+}
+
+dnscrypt_ok() {
+    ss -lnu 2>/dev/null |
+        grep -q '127\.0\.0\.1:53' ||
+        return 1
+
+    timeout 3 dnscrypt-proxy \
+        -config /etc/dnscrypt-proxy/dnscrypt-proxy.toml \
+        -resolve example.com \
+        >/dev/null 2>&1
+}
+
+reload_dns() {
+    nmcli general reload >/dev/null 2>&1 || true
+
+    nmcli -t -f DEVICE,STATE device |
+    while IFS=: read -r dev state; do
+        [ "$state" = "connected" ] || continue
+        nmcli device reapply "$dev" >/dev/null 2>&1 || true
+    done
+}
+
+enable_dnscrypt() {
+    if [ -f "$DISABLED" ]; then
+        mv "$DISABLED" "$ACTIVE"
+    fi
+
+    reload_dns
+}
+
+enable_fallback() {
+    if [ -f "$ACTIVE" ]; then
+        mv "$ACTIVE" "$DISABLED"
+    fi
+
+    reload_dns
+}
+
+while :; do
+    if dnscrypt_ok; then
+        fails=0
+
+        if [ "$state" != "dnscrypt" ]; then
+            enable_dnscrypt
+
+            if [ "$state" = "fallback" ]; then
+                notify_user normal \
+                    "DNSCrypt geri geldi" \
+                    "Şifreli DNS yeniden etkinleştirildi: 127.0.0.1"
+            fi
+
+            state="dnscrypt"
+        fi
+    else
+        fails=$((fails + 1))
+
+        if [ "$fails" -ge "$FAIL_LIMIT" ] &&
+           [ "$state" != "fallback" ]; then
+
+            enable_fallback
+
+            notify_user critical \
+                "DNSCrypt devre dışı" \
+                "NetworkManager'ın DHCP DNS sunucusuna geçildi."
+
+            state="fallback"
+        fi
+    fi
+
+    if [ "$fails" -gt 0 ] || [ "$state" = "fallback" ]; then
+        sleep "$INTERVAL_BAD"
+    else
+        sleep "$INTERVAL_OK"
+    fi
+done

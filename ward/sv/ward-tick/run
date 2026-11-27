@@ -1,0 +1,8 @@
+#!/bin/sh
+# Loads the blocklist at boot, then one cheap check per hour; heavy jobs wait for mains power.
+exec 2>&1
+/usr/local/sbin/ward net load
+while :; do
+    /usr/local/sbin/ward tick
+    sleep 3600
+done
